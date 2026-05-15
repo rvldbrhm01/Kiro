@@ -15,7 +15,7 @@ from tools import TOOL_SCHEMAS, run_tool
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
+DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
 MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "4096"))
 MAX_TOOL_ITERATIONS = int(os.environ.get("MAX_TOOL_ITERATIONS", "10"))
 MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "30"))
