@@ -1,24 +1,30 @@
 """
 Claude agent loop with tool use + per-user conversation memory.
 Persona: Kiro - AI software engineer.
+
+Fitur fallback: jika model utama (Opus 4.7) kena rate limit / overloaded,
+otomatis turun ke model cadangan (Sonnet 4.5).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
-from anthropic import Anthropic
+from anthropic import Anthropic, RateLimitError, APIStatusError
 
 from tools import TOOL_SCHEMAS, run_tool
 
 log = logging.getLogger(__name__)
 
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-7")
+FALLBACK_MODEL = os.environ.get("CLAUDE_FALLBACK_MODEL", "claude-sonnet-4-5-20250929")
 MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", "4096"))
 MAX_TOOL_ITERATIONS = int(os.environ.get("MAX_TOOL_ITERATIONS", "10"))
 MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "30"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "2"))
 
 SYSTEM_PROMPT = """You are Kiro, an AI software engineer assistant running inside a Telegram bot.
 
@@ -59,11 +65,18 @@ You can help with:
 
 
 class ClaudeAgent:
-    """Stateful agent: keeps conversation history per chat_id."""
+    """Stateful agent: keeps conversation history per chat_id.
+    
+    Fallback logic:
+    - Coba model utama (claude-opus-4-7)
+    - Jika kena RateLimitError / 529 Overloaded → retry sekali setelah 5 detik
+    - Jika masih gagal → fallback ke model cadangan (claude-sonnet-4-5-20250929)
+    """
 
     def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL) -> None:
         self.client = Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
         self.model = model
+        self.fallback_model = FALLBACK_MODEL
         # chat_id -> list of {"role": ..., "content": ...} messages
         self._histories: dict[int, list[dict[str, Any]]] = {}
 
@@ -79,14 +92,9 @@ class ClaudeAgent:
         """Keep history under MAX_HISTORY_MESSAGES, never splitting tool pairs."""
         history = self._histories.get(chat_id, [])
         while len(history) > MAX_HISTORY_MESSAGES:
-            # Always remove from the front; skip if it would split a tool pair
             if not history:
                 break
-            # Drop first message
             history.pop(0)
-            # If the new first message is an assistant turn whose content has
-            # tool_use blocks, we must also drop the following user turn that
-            # holds tool_result — otherwise the API will reject the history.
             while (
                 history
                 and history[0]["role"] == "assistant"
@@ -98,25 +106,69 @@ class ClaudeAgent:
                     for b in history[0]["content"]
                 )
             ):
-                history.pop(0)  # assistant tool_use turn
+                history.pop(0)
                 if history and history[0]["role"] == "user":
-                    history.pop(0)  # corresponding tool_result turn
+                    history.pop(0)
+
+    # -- API call with fallback --------------------------------------------
+
+    def _call_api(self, model: str, messages: list[dict[str, Any]]) -> Any:
+        """Call Claude API. Raises on non-retryable errors."""
+        return self.client.messages.create(
+            model=model,
+            max_tokens=MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            tools=TOOL_SCHEMAS,
+            messages=messages,
+        )
+
+    def _call_with_fallback(self, messages: list[dict[str, Any]]) -> tuple[Any, str]:
+        """
+        Try primary model → retry once on rate limit → fallback to secondary.
+        Returns (response, model_used).
+        """
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = self._call_api(self.model, messages)
+                return response, self.model
+            except RateLimitError as exc:
+                log.warning(
+                    "Rate limit pada %s (attempt %d/%d): %s",
+                    self.model, attempt + 1, MAX_RETRIES, exc,
+                )
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(5)  # tunggu 5 detik sebelum retry
+            except APIStatusError as exc:
+                # 529 = Overloaded
+                if exc.status_code == 529:
+                    log.warning(
+                        "Model %s overloaded (attempt %d/%d)",
+                        self.model, attempt + 1, MAX_RETRIES,
+                    )
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(5)
+                else:
+                    raise  # error lain, langsung raise
+
+        # Semua retry gagal → fallback ke model cadangan
+        log.info(
+            "Fallback dari %s ke %s karena high traffic",
+            self.model, self.fallback_model,
+        )
+        response = self._call_api(self.fallback_model, messages)
+        return response, self.fallback_model
 
     # -- Main entry point --------------------------------------------------
 
     def chat(self, chat_id: int, user_message: str) -> str:
-        """Send a user message and return Claude's final text reply."""
+        """Send a user message and return Claude's final text reply.
+        Auto-fallback jika model utama high traffic."""
         history = self._history(chat_id)
         history.append({"role": "user", "content": user_message})
 
+        model_used = self.model
         for _iteration in range(MAX_TOOL_ITERATIONS):
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                tools=TOOL_SCHEMAS,
-                messages=history,
-            )
+            response, model_used = self._call_with_fallback(messages=history)
 
             # Store the full assistant turn (text + any tool_use blocks).
             history.append({"role": "assistant", "content": response.content})
@@ -125,6 +177,9 @@ class ClaudeAgent:
                 final_text = "".join(
                     block.text for block in response.content if block.type == "text"
                 ).strip()
+                # Tambahkan info jika pakai fallback
+                if model_used != self.model:
+                    final_text += f"\n\n_⚠️ Model utama ({self.model}) sedang high traffic. Balasan ini dari {model_used}._"
                 self._trim(chat_id)
                 return final_text or "(no reply)"
 
@@ -145,4 +200,4 @@ class ClaudeAgent:
             history.append({"role": "user", "content": tool_results})
 
         self._trim(chat_id)
-        return "Sorry, I got stuck in a tool loop. Please try /reset and rephrase your request."
+        return "Maaf, saya terjebak dalam loop tool. Coba /reset dan ulangi pertanyaan."
